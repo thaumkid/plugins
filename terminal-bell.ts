@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 
 // note to users: make sure Bun is installed
+// this script does require your terminal program to have automation permissions
 
 const PLAY_COUNT = 3;          // total repetitions
 const WAIT_INTERVAL = 3000;    // ms between repeats
@@ -24,7 +25,7 @@ interface TerminalApp {
 // note: only the first 3 have been tested
 const TERMINALS: TerminalApp[] = [
   { name: "Terminal", eventsName: "Terminal", hasScripting: true },
-  { name: "iTerm2", eventsName: "iTerm2", hasScripting: true },
+  { name: "iTerm2", eventsName: "iTerm2", hasScripting: true }, // has a python API that is much easier than our approach, but requires making the terminal less safe
   { name: "kitty", eventsName: "kitty", hasScripting: false },
   { name: "Ghostty", eventsName: "Ghostty", hasScripting: false },
   { name: "WezTerm", eventsName: "WezTerm", hasScripting: false },
@@ -114,29 +115,6 @@ async function getSessionTTY($) {
   }
   return null;
 }
-
-// NOTE: pyobjc route (alternative to JXA)
-// ================================================
-// If you want to use Python + pyobjc instead of osascript -l JavaScript, install via:
-//   pip3 install pyobjc
-// Then replace the Bun.spawn call with a Python subprocess that uses OSAKit or ScriptingBridge.
-// Example using OSAKit (OSAKit.OSAScript):
-//
-//   import subprocess
-//   python_code = '''
-//   import objc
-//   from Foundation import *
-//   from OSAKit import *
-//   script = """tell application "iTerm2" ... end tell"""  # same AppleScript as below
-//   osaScript = OSAScript.alloc().initWithSource_error_(script, None)
-//   result, error = osaScript.execute_error_(None)
-//   print(result)
-//   '''
-//   result = subprocess.run(["python3", "-c", python_code], capture_output=True, text=True)
-//
-// Caveats: pyobjc is heavy (~200MB), requires pip install, and uses the same AppleScript bridge
-// under the hood — it just gives you programmatic access to OSAKit instead of spawning osascript.
-// For this plugin JXA via `osascript -l JavaScript` is lighter (no deps) and simpler.
 
 async function getFocusedIterm2TabTTYS($) {
   // Use AppleScript (not JXA) because JXA cannot resolve iTerm2 session objects in this version.
