@@ -3,8 +3,8 @@ import fs from "fs/promises";
 // note to users: make sure Bun is installed
 
 const PLAY_COUNT = 3;          // total repetitions
-const WAIT_INTERVAL = 5000;    // ms between repeats
-const COOLDOWN_MS = 30_000;    // min seconds between bell triggers
+const WAIT_INTERVAL = 3000;    // ms between repeats
+const COOLDOWN_MS = 15_000;    // min ms between bell triggers
 let lastBellTimestamp = 0;     // epoch ms of last trigger
 
 const LOG_ENABLED = true;
@@ -139,54 +139,40 @@ async function getSessionTTY($) {
 // For this plugin JXA via `osascript -l JavaScript` is lighter (no deps) and simpler.
 
 async function getFocusedIterm2TabTTYS($) {
-  // Use JXA (JavaScript for Automation) instead of AppleScript because iTerm2 3.6.x defines
-  // "tty" as an AppleScript class name, causing error -2741 ("Expected variable name or
-  // property but found class name") when accessing tty via the traditional `tty of sess` syntax.
-  // Use AppleScript to get TTY from the currently focused tab's current pane.
-  // `current window` in iTerm2 AppleScript refers to the window with focus,
-  // and `current tab of current window` gives us the selected tab.
-  const result = await $`osascript -e '
-    tell application "System Events" to set itermFrontmost to frontmost of process "iTerm2"
-    if not itermFrontmost then return ""
-    
-    tell application "iTerm2"
-      try
-        -- current window is the focused window; current tab is the selected tab in that window
-        set theTab to current tab of (current window)
-        
-        -- Get all panes/sessions from this tab
-        set paneList to every pane of theTab
-        set ttyList to {}
-        
-        repeat with p in paneList
-          try
-            set theTTY to (tty of p as text)
-            if theTTY is not "" then
-              set end of ttyList to theTTY
-            end if
-          end try
-        end repeat
-        
-        -- Return newline-separated TTYs, stripping /dev/ prefix
-        set AppleScript\'s text item delimiters to linefeed
-        return (ttyList as text)
-      on error errMsg
-        return "ERROR:" & errMsg
-      end try
-    end tell
-  ' 2>/dev/null`.quiet();
+  // Use AppleScript (not JXA) because JXA cannot resolve iTerm2 session objects in this version.
+  // Since System Events already confirms iTerm2 is frontmost, we use "current window" directly
+  // instead of looping all windows with the broken "focused" property check.
   
-  const raw = result.stdout.toString().trim();
-  await log("getFocusedIterm2TabTTYS: raw output:", JSON.stringify(raw));
-  
-  if (!raw || raw.startsWith("ERROR") || raw === "missing value" || raw === "") {
-    await log("getFocusedIterm2TabTTYS: no iTerm2 sessions with tty found");
-    return [];
-  }
+  const appleScript = `
+tell application "iTerm2"
+  try
+    set t to current tab of current window
+    set ttyList to {}
+    repeat with s in sessions of t
+      set theTTY to tty of s as text
+      if theTTY starts with "/dev/" then
+        set end of ttyList to (text 6 thru -1 of theTTY)
+      else if theTTY is not "" then
+        set end of ttyList to theTTY
+      end if
+    end repeat
+    set AppleScript's text item delimiters to linefeed
+    return ttyList as text
+  on error errMsg number errNum
+    return "ERROR:" & errNum & "|" & errMsg
+  end try
+end tell
+`;
 
-  const items = raw.split("\n").map(s => normalizeTTY(s)).filter(Boolean);
-  await log("getFocusedIterm2TabTTYS: parsed ttys:", JSON.stringify(items));
-  return items;
+  const result = await $`osascript -e ${appleScript}`.quiet();
+  const raw = result.stdout.toString().trim();
+  await log("getFocusedIterm2TabTTYS: AppleScript output:", JSON.stringify(raw));
+  
+  if (!raw || raw.startsWith("ERROR:") || raw === "") { return []; }
+  
+  const ttys = raw.split("\n").map(t => t.trim()).filter(Boolean).map(normalizeTTY).filter(Boolean);
+  await log("getFocusedIterm2TabTTYS: parsed ttys:", JSON.stringify(ttys));
+  return ttys;
 }
 
 async function getFocusedTerminalAppTabTTY($) {
