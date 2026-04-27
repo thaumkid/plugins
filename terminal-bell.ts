@@ -357,6 +357,13 @@ export const TerminalBell: Plugin = async ({ project, client, $, directory, work
   return {
     event: async ({ event }) => {
 
+      // Clear log on new session start — session.created is published as a bus event by the sync system
+      if (event.type === "session.created") {
+        await fs.unlink(LOG_PATH).catch(() => {});
+        await log("Cleared log for new session", event.properties.sessionID);
+        return;
+      }
+
       // Skip subagent sessions — they run independently without needing user attention
       if (event.type === "session.idle" && event.properties.sessionID) {
         try {
