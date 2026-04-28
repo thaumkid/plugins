@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 
 // note to users: make sure Bun is installed
-// this script does require your terminal program to have automation permissions
+// this script requires your terminal program to have "System Events" permissions, which will be asked for on first execution
 
 const PLAY_COUNT = 3;          // total repetitions
 const WAIT_INTERVAL = 3000;    // ms between repeats
@@ -25,9 +25,9 @@ interface TerminalApp {
 // note: only the first 3 have been tested
 const TERMINALS: TerminalApp[] = [
   { name: "Terminal", eventsName: "Terminal", hasScripting: true },
-  { name: "iTerm2", eventsName: "iTerm2", hasScripting: true }, // has a python API that is much easier than our approach, but requires making the terminal less safe
-  { name: "kitty", eventsName: "kitty", hasScripting: false },
-  { name: "Ghostty", eventsName: "Ghostty", hasScripting: false },
+  { name: "iTerm2", eventsName: "iTerm2", hasScripting: true }, // has a python API that could be much easier than our approach
+  { name: "kitty", eventsName: "kitty", hasScripting: true }, // to fully work, add the lines 'allow_remote_control yes' and 'listen_on unix:{kitty_pid}' to ~/.config/kitty/kitty.conf
+  { name: "Ghostty", eventsName: "Ghostty", hasScripting: true }, // Requires a build with tty/pid on terminal objects (after commit sha 9a9002202b8767e6e99c2bb48fad09fc0ae02870, April 2026)
   { name: "WezTerm", eventsName: "WezTerm", hasScripting: false },
   { name: "Alacritty", eventsName: "Alacritty", hasScripting: false },
 ];
@@ -61,7 +61,7 @@ async function getParentTerminal($) {
       const commName = comm.split("/").pop() || comm;
 
       for (const term of TERMINALS) {
-        if (commName === term.name) {
+        if (commName.toLowerCase() === term.name.toLowerCase()) {
           await log("getParentTerminal: FOUND terminal", term.name, "eventsName:", term.eventsName, "pid:", currentPid);
           return { eventsName: term.eventsName, pid: currentPid };
         }
@@ -153,6 +153,94 @@ end tell
   return ttys;
 }
 
+// Recursively traverse the kitty IPC hierarchy following only nodes where is_focused === true.
+// Returns true if a node with is_self === true is found along such a focused chain.
+function findSelfAlongFocusedChain(node: Record<string, unknown>): boolean {
+  // Check if this node has its own focus state — if it's false, this branch is dead
+  const isFocused = (node.is_focused as boolean | undefined) ?? true;
+  if (!isFocused) return false;
+
+  // If this node is our session and it reports itself as focused, we found the chain
+  if (node.is_self === true && node.is_focused === true) return true;
+
+  // Recurse into children: tabs or windows arrays
+  const tabs = node.tabs as Array<Record<string, unknown>> | undefined;
+  if (tabs) {
+    for (const child of tabs) {
+      if (findSelfAlongFocusedChain(child)) return true;
+    }
+  }
+
+  const windows = node.windows as Array<Record<string, unknown>> | undefined;
+  if (windows) {
+    for (const child of windows) {
+      if (findSelfAlongFocusedChain(child)) return true;
+    }
+  }
+
+  return false;
+}
+
+async function getFocusedKittyTabTTYS($) {
+  try {
+    const result = await $`kitty @ ls 2>/dev/null`.quiet();
+    const raw = result.stdout.toString().trim();
+    if (!raw) { await log("getFocusedKittyTabTTYS: no kitty @ ls output (remote control may not be enabled)"); return []; }
+
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      await log("getFocusedKittyTabTTYS: invalid JSON:", raw.substring(0, 200));
+      return [];
+    }
+
+    if (!Array.isArray(data)) { await log("getFocusedKittyTabTTYS: unexpected JSON structure (expected array)"); return []; }
+    if (data.length === 0) { await log("getFocusedKittyTabTTYS: no windows in kitty @ ls output"); return []; }
+
+    // Recursively traverse the IPC tree following only is_focused chains.
+    // If our session (is_self=true) is found along a fully-focused chain, we're focused.
+    let focusedChainFound = false;
+    for (const w of data as Array<Record<string, unknown>>) {
+      if (findSelfAlongFocusedChain(w)) { focusedChainFound = true; break; }
+    }
+
+    await log("getFocusedKittyTabTTYS: kitty IPC connected,", data.length, "window(s), focused chain found:", focusedChainFound);
+
+    if (!focusedChainFound) { return []; }
+
+    // IPC confirms focus — get our TTY to pass through to the caller.
+    const ourTTY = normalizeTTY(await getSessionTTY($));
+    await log("getFocusedKittyTabTTYS: ourTTY=", JSON.stringify(ourTTY));
+    if (!ourTTY) { return []; }
+    return [ourTTY];
+  } catch (err) {
+    await log("getFocusedKittyTabTTYS: ERROR", String(err));
+    return [];
+  }
+}
+
+
+async function getFocusedGhosttyTabTTY($) {
+  const appleScript = `tell application "Ghostty"
+  try
+    return (tty of focused terminal of selected tab of front window) as text
+  on error errMsg number errNum
+    return "ERROR:" & errNum & "|" & errMsg
+  end try
+end tell`;
+
+  const result = await $`osascript -e ${appleScript}`.quiet();
+  const raw = result.stdout.toString().trim();
+  await log("getFocusedGhosttyTabTTY: AppleScript output:", JSON.stringify(raw));
+  
+  if (!raw || raw.startsWith("ERROR:") || raw === "") { return null; }
+  
+  const normalized = normalizeTTY(raw);
+  await log("getFocusedGhosttyTabTTY: normalized to", JSON.stringify(normalized));
+  return normalized;
+}
+
 async function getFocusedTerminalAppTabTTY($) {
   const result = await $`osascript -e 'tell application "Terminal"' -e 'repeat with w from 1 to (count of windows)' -e 'tell window w' -e 'try' -e 'if frontmost then return (tty as text)' -e 'end try' -e 'end tell' -e 'end repeat' -e 'return ""' -e 'end tell' 2>/dev/null`.quiet();
   const raw = result.stdout.toString().trim();
@@ -203,6 +291,76 @@ async function isTerminalFocused($) {
         }
       }
       await log("isTerminalFocused iTerm2: no TTY match — another session has focus, continuing bell");
+      return false;
+    }
+
+    if (terminal.eventsName === "kitty") {
+      let ourTTY = "";
+      try {
+        ourTTY = normalizeTTY(await getSessionTTY($));
+      } catch (err) {
+        await log("isTerminalFocused kitty: failed to get our TTY:", String(err));
+      }
+
+      if (ourTTY === "") {
+        await log("isTerminalFocused kitty: no session TTY found");
+        return false;
+      }
+
+      let focusedTabTTYS: string[] = [];
+      try {
+        focusedTabTTYS = await getFocusedKittyTabTTYS($);
+      } catch (err) {
+        await log("isTerminalFocused kitty: getFocusedKittyTabTTYS failed — another session likely has focus");
+        return false;
+      }
+
+      if (focusedTabTTYS.length > 0) {
+        if (focusedTabTTYS.includes(ourTTY)) {
+          await log("isTerminalFocused kitty: IPC TTY match — our session is in a focused tab");
+          return true;
+        }
+        await log("isTerminalFocused kitty: IPC no TTY match — another session has focus, continuing bell");
+        return false;
+      }
+
+      await log("isTerminalFocused kitty: no focused window found by IPC — another session has focus, continuing bell");
+      return false;
+    }
+
+    // Ghostty: TTY-based comparison via AppleScript (requires prerelease build with tty on terminal objects)
+    if (terminal.eventsName === "Ghostty") {
+      let ourTTY = "";
+      try {
+        ourTTY = normalizeTTY(await getSessionTTY($));
+      } catch (err) {
+        await log("isTerminalFocused Ghostty: failed to get our TTY:", String(err));
+      }
+
+      if (ourTTY === "") {
+        await log("isTerminalFocused Ghostty: no session TTY found");
+        return false;
+      }
+
+      let focusedTabTTY = "";
+      try {
+        focusedTabTTY = await getFocusedGhosttyTabTTY($);
+      } catch (err) {
+        await log("isTerminalFocused Ghostty: getFocusedGhosttyTabTTY failed — another session likely has focus");
+        return false;
+      }
+
+      await log("isTerminalFocused Ghostty: ourTTY=", JSON.stringify(ourTTY), "focusedTabTTY=", JSON.stringify(focusedTabTTY));
+      if (ourTTY !== "" && focusedTabTTY !== null) {
+        if (ourTTY === normalizeTTY(focusedTabTTY)) {
+          await log("isTerminalFocused Ghostty: TTY match — our session is in a focused tab");
+          return true;
+        }
+        await log("isTerminalFocused Ghostty: TTY mismatch — another session has focus, continuing bell");
+        return false;
+      }
+
+      await log("isTerminalFocused Ghostty: no focused terminal found by AppleScript — another session has focus, continuing bell");
       return false;
     }
 
@@ -275,7 +433,7 @@ async function isInFrontmostTerminal(pid: number, frontmostName: string, $) {
       const commName = comm.split("/").pop() || comm;
 
       for (const term of TERMINALS) {
-        if (commName === term.name) {
+        if (commName.toLowerCase() === term.name.toLowerCase()) {
           // Found which terminal we're running in - check if it's frontmost
           await log("isInFrontmostTerminal: found ancestor terminal", term.name, "at depth", depth);
           const frontmost = await $`osascript -e 'tell application "System Events" to get frontmost of process "${term.eventsName}"' 2>/dev/null`.quiet();
@@ -354,10 +512,9 @@ async function playAlert($, label = "") {
 }
 
 export const TerminalBell: Plugin = async ({ project, client, $, directory, worktree }) => {
-  return {
+  return { // look up types.gen.ts at https://github.com/anomalyco/opencode/ for event types
     event: async ({ event }) => {
-
-      // Clear log on new session start — session.created is published as a bus event by the sync system
+      // Clear log on new session start — session.created is published as a bus event by the sync system. There is no event to capture for opencode app startup.
       if (event.type === "session.created") {
         await fs.unlink(LOG_PATH).catch(() => {});
         await log("Cleared log for new session", event.properties.sessionID);
@@ -373,7 +530,7 @@ export const TerminalBell: Plugin = async ({ project, client, $, directory, work
         } catch { /* ignore lookup errors */ }
       }
 
-      const isTriggerEvent = event.type === "session.idle" || event.type === "permission.asked" || event.type === "session.error" || event.type === "question.asked"; // question.asked event not documented, but definitely exists and found here - https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/question/index.ts
+      const isTriggerEvent = event.type === "session.idle" || event.type === "permission.asked" || event.type === "session.error" || event.type === "question.asked"; // question.asked event not documented, but exists and found here - https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/question/index.ts
       if (!isTriggerEvent) return;
       
       log("EVENT", event.type, JSON.stringify(event.properties));
