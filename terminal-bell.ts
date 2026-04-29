@@ -19,6 +19,7 @@ async function log(...args: unknown[]) {
 interface TerminalApp {
   name: string;           // matches .app/Contents/MacOS/<name> in process comm  
   eventsName: string;     // System Events process name (usually same as `name`)
+  aliases?: string[];     // additional process names that map to this terminal
   hasScripting: boolean;  // supports AppleScript window PID queries
 }
 
@@ -28,7 +29,7 @@ const TERMINALS: TerminalApp[] = [
   { name: "iTerm2", eventsName: "iTerm2", hasScripting: true }, // has a python API that could be much easier than our approach
   { name: "kitty", eventsName: "kitty", hasScripting: true }, // to fully work, add the lines 'allow_remote_control yes' and 'listen_on unix:{kitty_pid}' to ~/.config/kitty/kitty.conf
   { name: "Ghostty", eventsName: "Ghostty", hasScripting: true }, // Requires a build with tty/pid on terminal objects (after commit sha 9a9002202b8767e6e99c2bb48fad09fc0ae02870, April 2026)
-  { name: "WezTerm", eventsName: "WezTerm", hasScripting: false },
+  { name: "WezTerm", eventsName: "WezTerm", aliases: ["wezterm-gui"], hasScripting: true }, // WezTerm doesn't expose globally-focused pane info via AppleScript — uses get-text comparison with subprocess trick to unset $WEZTERM_PANE
   { name: "Alacritty", eventsName: "Alacritty", hasScripting: false },
 ];
 
@@ -61,7 +62,9 @@ async function getParentTerminal($) {
       const commName = comm.split("/").pop() || comm;
 
       for (const term of TERMINALS) {
-        if (commName.toLowerCase() === term.name.toLowerCase()) {
+        const nameMatch = commName.toLowerCase() === term.name.toLowerCase();
+        const aliasMatch = term.aliases?.some(a => a.toLowerCase() === commName.toLowerCase());
+        if (nameMatch || aliasMatch) {
           await log("getParentTerminal: FOUND terminal", term.name, "eventsName:", term.eventsName, "pid:", currentPid);
           return { eventsName: term.eventsName, pid: currentPid };
         }
@@ -364,6 +367,43 @@ async function isTerminalFocused($) {
       return false;
     }
 
+    // WezTerm: compare focused pane text with our pane text via CLI
+    // Spawn via zsh to ensure $WEZTERM_PANE is not inherited, so wezterm falls back to showing the globally-focused pane
+    if (terminal.eventsName === "WezTerm") {
+      const ourPane = process.env.WEZTERM_PANE;
+      await log("isTerminalFocused WezTerm: WEZTERM_PANE=", JSON.stringify(ourPane));
+      if (!ourPane) {
+        await log("isTerminalFocused WezTerm: no WEZTERM_PANE set");
+        return false;
+      }
+
+      let activeText = "";
+      try {
+        const result = await $`zsh -c 'env -u WEZTERM_PANE wezterm cli get-text'`.quiet();
+        activeText = result.stdout.toString().trim();
+      } catch (err) {
+        await log("isTerminalFocused WezTerm: get-text failed:", String(err));
+        return false;
+      }
+
+      let ourText = "";
+      try {
+        const result = await $`wezterm cli get-text --pane-id ${ourPane} 2>/dev/null`.quiet();
+        ourText = result.stdout.toString().trim();
+      } catch (err) {
+        await log("isTerminalFocused WezTerm: get-text for pane failed:", String(err));
+        return false;
+      }
+
+      await log("isTerminalFocused WezTerm: activeText=", JSON.stringify(activeText.substring(0, 100)), "ourText=", JSON.stringify(ourText.substring(0, 100)));
+      if (activeText !== "" && activeText === ourText) {
+        await log("isTerminalFocused WezTerm: text match — our pane is focused");
+        return true;
+      }
+      await log("isTerminalFocused WezTerm: no text match — another pane has focus, continuing bell");
+      return false;
+    }
+
     // For scriptable terminals that support per-window PID detection, compare directly
     const focusedPid = await getFocusedWindowPid(terminal.eventsName, $);
     if (focusedPid !== null) {
@@ -433,7 +473,9 @@ async function isInFrontmostTerminal(pid: number, frontmostName: string, $) {
       const commName = comm.split("/").pop() || comm;
 
       for (const term of TERMINALS) {
-        if (commName.toLowerCase() === term.name.toLowerCase()) {
+        const nameMatch = commName.toLowerCase() === term.name.toLowerCase();
+        const aliasMatch = term.aliases?.some(a => a.toLowerCase() === commName.toLowerCase());
+        if (nameMatch || aliasMatch) {
           // Found which terminal we're running in - check if it's frontmost
           await log("isInFrontmostTerminal: found ancestor terminal", term.name, "at depth", depth);
           const frontmost = await $`osascript -e 'tell application "System Events" to get frontmost of process "${term.eventsName}"' 2>/dev/null`.quiet();
@@ -503,7 +545,7 @@ async function playAlert($, label = "") {
   log("playAlert", label || "first");
   await Bun.write(Bun.stdout, "\x07");
   try {
-    await $`afplay /System/Library/Sounds/Ping.aiff`.quiet();
+    await $`afplay /System/Library/Sounds/Ping.aiff 2>/dev/null`.quiet();
     log("afplay OK", label);
   } catch (err) {
     console.warn("Failed to play audible bell:", err);
