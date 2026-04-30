@@ -23,14 +23,13 @@ interface TerminalApp {
   hasScripting: boolean;  // supports AppleScript window PID queries
 }
 
-// note: only the first 3 have been tested
 const TERMINALS: TerminalApp[] = [
   { name: "Terminal", eventsName: "Terminal", hasScripting: true },
   { name: "iTerm2", eventsName: "iTerm2", hasScripting: true }, // has a python API that could be much easier than our approach
   { name: "kitty", eventsName: "kitty", hasScripting: true }, // to fully work, add the lines 'allow_remote_control yes' and 'listen_on unix:{kitty_pid}' to ~/.config/kitty/kitty.conf
   { name: "Ghostty", eventsName: "Ghostty", hasScripting: true }, // Requires a build with tty/pid on terminal objects (after commit sha 9a9002202b8767e6e99c2bb48fad09fc0ae02870, April 2026)
   { name: "WezTerm", eventsName: "WezTerm", aliases: ["wezterm-gui"], hasScripting: true }, // WezTerm doesn't expose globally-focused pane info via AppleScript — uses get-text comparison with subprocess trick to unset $WEZTERM_PANE
-  { name: "Alacritty", eventsName: "Alacritty", hasScripting: false },
+  { name: "Alacritty", eventsName: "Alacritty", hasScripting: true }, // Alacritty: can only query focused window title via AppleScript, not our own window title, so we just do a best effort here
 ];
 
 interface TerminalInfo {
@@ -260,6 +259,14 @@ function normalizeTTY(tty: string | null): string {
   return tty.replace(/^\/dev\//, "").trim();
 }
 
+async function getFocusedAlacrittyWindowTitle($) {
+  const result = await $`osascript -e 'tell application "System Events" to get title of front window of process "Alacritty"' 2>/dev/null`.quiet();
+  const raw = result.stdout.toString().trim();
+  if (!raw) { await log("getFocusedAlacrittyWindowTitle: no title returned"); return null; }
+  await log("getFocusedAlacrittyWindowTitle: focused title=", JSON.stringify(raw));
+  return raw;
+}
+
 async function isTerminalFocused($) {
   const terminal = await getParentTerminal($);
   if (!terminal) { await log("isTerminalFocused: no terminal found"); return false; }
@@ -401,6 +408,17 @@ async function isTerminalFocused($) {
         return true;
       }
       await log("isTerminalFocused WezTerm: no text match — another pane has focus, continuing bell");
+      return false;
+    }
+
+    // Alacritty: focus detection via window title — we can only read the focused window's title via AppleScript
+    if (terminal.eventsName === "Alacritty") {
+      const focusedTitle = await getFocusedAlacrittyWindowTitle($);
+      if (focusedTitle && (focusedTitle.startsWith("OC | ") || focusedTitle === "OpenCode")) {
+        await log("isTerminalFocused Alacritty: focused title starts with \"OC | \" or equals \"OpenCode\" — opencode window has focus");
+        return true;
+      }
+      await log("isTerminalFocused Alacritty: focused title=", JSON.stringify(focusedTitle), "— not an opencode window, continuing bell");
       return false;
     }
 
