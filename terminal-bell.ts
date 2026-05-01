@@ -3,610 +3,403 @@ import fs from "fs/promises";
 // note to users: make sure Bun is installed
 // this script requires your terminal program to have "System Events" permissions, which will be asked for on first execution
 
-const PLAY_COUNT = 3;          // total repetitions
-const WAIT_INTERVAL = 3000;    // ms between repeats
-const COOLDOWN_MS = 15_000;    // min ms between bell triggers
-let lastBellTimestamp = 0;     // epoch ms of last trigger
+// ─── Configuration ────────────────────────────────────────────────────────────
+
+const PLAY_COUNT = 3; // total repetitions
+const WAIT_INTERVAL = 3000; // ms between repeats
+const COOLDOWN_MS = 30_000; // min ms between separate bell trigger events
+const BELL_CHAR = "\x07";
+const BELL_SOUND = "/System/Library/Sounds/Ping.aiff";
+const TRIGGER_EVENT_TYPES = [
+  "session.idle",
+  "permission.asked",
+  "session.error",
+  "question.asked",
+];
+
+const OC_WINDOW_PREFIX = "OC | ";
+const OC_WINDOW_TITLE = "OpenCode";
+let lastBellTimestamp = Date.now() - COOLDOWN_MS; // epoch ms of last trigger
+
+// Terminals tested and supported (process names match .app/Contents/MacOS/<name>)
+// iTerm2: process name for iTerm. has a python API that could be easier than our approach, but ours works without Magic - Python API enabled
+// kitty: to fully work, add the lines 'allow_remote_control yes' and 'listen_on unix:{kitty_pid}' to ~/.config/kitty/kitty.conf
+// Ghostty: Requires a build with tty/pid on terminal objects, late April 2026 or later
+// wezterm-gui: process name for WezTerm. doesn't expose enough data, so I use a get-text comparison with a subprocess trick to make it work
+// Alacritty: doesn't expose enough data, so we just do a best effort here
+const TERMINALS = [
+  "Terminal",
+  "iTerm2",
+  "kitty",
+  "Ghostty",
+  "wezterm-gui",
+  "Alacritty",
+];
+
+// ─── Logging ─────────────────────────────────────────────────────────────────
 
 const LOG_ENABLED = true;
 const LOG_PATH = `${import.meta.dir}/terminal-bell.log`;
+
 async function log(...args: unknown[]) {
   if (!LOG_ENABLED) return;
   const ts = new Date().toISOString();
   await fs.appendFile(LOG_PATH, `[${ts}] ${args.join(" ")}\n`);
 }
 
-interface TerminalApp {
-  name: string;           // matches .app/Contents/MacOS/<name> in process comm  
-  eventsName: string;     // System Events process name (usually same as `name`)
-  aliases?: string[];     // additional process names that map to this terminal
-  hasScripting: boolean;  // supports AppleScript window PID queries
-}
-
-const TERMINALS: TerminalApp[] = [
-  { name: "Terminal", eventsName: "Terminal", hasScripting: true },
-  { name: "iTerm2", eventsName: "iTerm2", hasScripting: true }, // has a python API that could be much easier than our approach
-  { name: "kitty", eventsName: "kitty", hasScripting: true }, // to fully work, add the lines 'allow_remote_control yes' and 'listen_on unix:{kitty_pid}' to ~/.config/kitty/kitty.conf
-  { name: "Ghostty", eventsName: "Ghostty", hasScripting: true }, // Requires a build with tty/pid on terminal objects (after commit sha 9a9002202b8767e6e99c2bb48fad09fc0ae02870, April 2026)
-  { name: "WezTerm", eventsName: "WezTerm", aliases: ["wezterm-gui"], hasScripting: true }, // WezTerm doesn't expose globally-focused pane info via AppleScript — uses get-text comparison with subprocess trick to unset $WEZTERM_PANE
-  { name: "Alacritty", eventsName: "Alacritty", hasScripting: true }, // Alacritty: can only query focused window title via AppleScript, not our own window title, so we just do a best effort here
-];
-
-interface TerminalInfo {
-  eventsName: string;
-  pid: number;
-}
-
-async function queryPid($, pid: number, column: string) {
-  const result = await $`ps -o ${column}= -p ${pid} 2>/dev/null`.quiet();
-  return result.stdout.toString().trim();
-}
-
-async function getParentTerminal($) {
-  try {
-    // Use Node.js process.pid to reliably get our current PID,
-    // avoiding shell expansion issues with $$ and macOS ps quirks.
-    const pid = process.pid;
-    await log("getParentTerminal: starting from pid", pid);
-
-    let currentPid = pid;
-    let depth = 0;
-
-    while (currentPid && !isNaN(currentPid) && currentPid !== 1) {
-      const comm = await queryPid($, currentPid, "comm");
-      await log("getParentTerminal depth", depth, "pid", currentPid, "comm:", comm);
-
-      if (!comm) break; // process no longer exists
-
-      const commName = comm.split("/").pop() || comm;
-
-      for (const term of TERMINALS) {
-        const nameMatch = commName.toLowerCase() === term.name.toLowerCase();
-        const aliasMatch = term.aliases?.some(a => a.toLowerCase() === commName.toLowerCase());
-        if (nameMatch || aliasMatch) {
-          await log("getParentTerminal: FOUND terminal", term.name, "eventsName:", term.eventsName, "pid:", currentPid);
-          return { eventsName: term.eventsName, pid: currentPid };
-        }
-      }
-
-      currentPid = parseInt(await queryPid($, currentPid, "ppid"), 10);
-      depth++;
-    }
-
-    await log("getParentTerminal: no terminal found in tree");
-    return null;
-  } catch (err) {
-    await log("getParentTerminal: ERROR", String(err));
-    return null;
-  }
-}
-
-async function getFocusedWindowPid(eventsName: string, $) {
-  if (eventsName === "iTerm2") {
-    try {
-      // Check if iTerm2 is frontmost via System Events
-      const frontmost = await $`osascript -e 'tell application "System Events" to get frontmost of process "iTerm2"' 2>/dev/null`.quiet();
-      if (frontmost.stdout.toString().trim() !== "true") { return null; }
-
-      // Get iTerm2's unix id from System Events
-      const result = await $`osascript -e 'tell application "System Events" to get unix id of process "iTerm2"' 2>/dev/null`.quiet();
-      const raw = result.stdout.toString().trim();
-      if (!raw) { return null; }
-      const pid = parseInt(raw, 10);
-      await log("getFocusedWindowPid iTerm2: parsed unix id:", pid, "isNaN:", isNaN(pid));
-      return isNaN(pid) ? null : pid;
-    } catch (err) {
-      await log("getFocusedWindowPid iTerm2: AppleScript failed:", String(err));
-      return null;
-    }
-  }
-
-  // Terminal.app returns null here; TTY-based check is done in isTerminalFocused.
-  await log("getFocusedWindowPid: returning null for", eventsName);
-  return null;
-}
-
-async function getSessionTTY($) {
-  let pid = process.pid;
-  while (pid && !isNaN(pid) && pid !== 1) {
-    const tty = await queryPid($, pid, "tty");
-    if (tty && tty !== "??") {
-      return tty.trim();
-    }
-    pid = parseInt(await queryPid($, pid, "ppid"), 10);
-  }
-  return null;
-}
-
-async function getFocusedIterm2TabTTYS($) {
-  // Use AppleScript (not JXA) because JXA cannot resolve iTerm2 session objects in this version.
-  // Since System Events already confirms iTerm2 is frontmost, we use "current window" directly
-  // instead of looping all windows with the broken "focused" property check.
-  
-  const appleScript = `
-tell application "iTerm2"
-  try
-    set t to current tab of current window
-    set ttyList to {}
-    repeat with s in sessions of t
-      set theTTY to tty of s as text
-      if theTTY starts with "/dev/" then
-        set end of ttyList to (text 6 thru -1 of theTTY)
-      else if theTTY is not "" then
-        set end of ttyList to theTTY
-      end if
-    end repeat
-    set AppleScript's text item delimiters to linefeed
-    return ttyList as text
-  on error errMsg number errNum
-    return "ERROR:" & errNum & "|" & errMsg
-  end try
-end tell
-`;
-
-  const result = await $`osascript -e ${appleScript}`.quiet();
-  const raw = result.stdout.toString().trim();
-  await log("getFocusedIterm2TabTTYS: AppleScript output:", JSON.stringify(raw));
-  
-  if (!raw || raw.startsWith("ERROR:") || raw === "") { return []; }
-  
-  const ttys = raw.split("\n").map(t => t.trim()).filter(Boolean).map(normalizeTTY).filter(Boolean);
-  await log("getFocusedIterm2TabTTYS: parsed ttys:", JSON.stringify(ttys));
-  return ttys;
-}
-
-// Recursively traverse the kitty IPC hierarchy following only nodes where is_focused === true.
-// Returns true if a node with is_self === true is found along such a focused chain.
-function findSelfAlongFocusedChain(node: Record<string, unknown>): boolean {
-  // Check if this node has its own focus state — if it's false, this branch is dead
-  const isFocused = (node.is_focused as boolean | undefined) ?? true;
-  if (!isFocused) return false;
-
-  // If this node is our session and it reports itself as focused, we found the chain
-  if (node.is_self === true && node.is_focused === true) return true;
-
-  // Recurse into children: tabs or windows arrays
-  const tabs = node.tabs as Array<Record<string, unknown>> | undefined;
-  if (tabs) {
-    for (const child of tabs) {
-      if (findSelfAlongFocusedChain(child)) return true;
-    }
-  }
-
-  const windows = node.windows as Array<Record<string, unknown>> | undefined;
-  if (windows) {
-    for (const child of windows) {
-      if (findSelfAlongFocusedChain(child)) return true;
-    }
-  }
-
-  return false;
-}
-
-async function getFocusedKittyTabTTYS($) {
-  try {
-    const result = await $`kitty @ ls 2>/dev/null`.quiet();
-    const raw = result.stdout.toString().trim();
-    if (!raw) { await log("getFocusedKittyTabTTYS: no kitty @ ls output (remote control may not be enabled)"); return []; }
-
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch (e) {
-      await log("getFocusedKittyTabTTYS: invalid JSON:", raw.substring(0, 200));
-      return [];
-    }
-
-    if (!Array.isArray(data)) { await log("getFocusedKittyTabTTYS: unexpected JSON structure (expected array)"); return []; }
-    if (data.length === 0) { await log("getFocusedKittyTabTTYS: no windows in kitty @ ls output"); return []; }
-
-    // Recursively traverse the IPC tree following only is_focused chains.
-    // If our session (is_self=true) is found along a fully-focused chain, we're focused.
-    let focusedChainFound = false;
-    for (const w of data as Array<Record<string, unknown>>) {
-      if (findSelfAlongFocusedChain(w)) { focusedChainFound = true; break; }
-    }
-
-    await log("getFocusedKittyTabTTYS: kitty IPC connected,", data.length, "window(s), focused chain found:", focusedChainFound);
-
-    if (!focusedChainFound) { return []; }
-
-    // IPC confirms focus — get our TTY to pass through to the caller.
-    const ourTTY = normalizeTTY(await getSessionTTY($));
-    await log("getFocusedKittyTabTTYS: ourTTY=", JSON.stringify(ourTTY));
-    if (!ourTTY) { return []; }
-    return [ourTTY];
-  } catch (err) {
-    await log("getFocusedKittyTabTTYS: ERROR", String(err));
-    return [];
-  }
-}
-
-
-async function getFocusedGhosttyTabTTY($) {
-  const appleScript = `tell application "Ghostty"
-  try
-    return (tty of focused terminal of selected tab of front window) as text
-  on error errMsg number errNum
-    return "ERROR:" & errNum & "|" & errMsg
-  end try
-end tell`;
-
-  const result = await $`osascript -e ${appleScript}`.quiet();
-  const raw = result.stdout.toString().trim();
-  await log("getFocusedGhosttyTabTTY: AppleScript output:", JSON.stringify(raw));
-  
-  if (!raw || raw.startsWith("ERROR:") || raw === "") { return null; }
-  
-  const normalized = normalizeTTY(raw);
-  await log("getFocusedGhosttyTabTTY: normalized to", JSON.stringify(normalized));
-  return normalized;
-}
-
-async function getFocusedTerminalAppTabTTY($) {
-  const result = await $`osascript -e 'tell application "Terminal"' -e 'repeat with w from 1 to (count of windows)' -e 'tell window w' -e 'try' -e 'if frontmost then return (tty as text)' -e 'end try' -e 'end tell' -e 'end repeat' -e 'return ""' -e 'end tell' 2>/dev/null`.quiet();
-  const raw = result.stdout.toString().trim();
-  if (!raw) { await log("getFocusedTerminalAppTabTTY: no frontmost window found"); return null; }
-  await log("getFocusedTerminalAppTabTTY: raw output:", JSON.stringify(raw));
-  // Normalize "/dev/ttysXXX" -> "ttysXXX" for comparison
-  const normalized = raw.replace(/^\/dev\//, "");
-  await log("getFocusedTerminalAppTabTTY: normalized to", JSON.stringify(normalized));
-  return normalized;
-}
+// ─── TTY Helpers ─────────────────────────────────────────────────────────────
 
 function normalizeTTY(tty: string | null): string {
   if (!tty) return "";
   return tty.replace(/^\/dev\//, "").trim();
 }
 
-async function getFocusedAlacrittyWindowTitle($) {
-  const result = await $`osascript -e 'tell application "System Events" to get title of front window of process "Alacritty"' 2>/dev/null`.quiet();
-  const raw = result.stdout.toString().trim();
-  if (!raw) { await log("getFocusedAlacrittyWindowTitle: no title returned"); return null; }
-  await log("getFocusedAlacrittyWindowTitle: focused title=", JSON.stringify(raw));
-  return raw;
+async function walkProcessTree(
+  $,
+  startPid: number,
+  column: string,
+  onValue: (value: string) => string | null,
+): Promise<string | null> {
+  let currentPid = startPid;
+  while (currentPid && !isNaN(currentPid) && currentPid !== 1) {
+    const result =
+      await $`ps -co ${column}=,ppid= -p ${currentPid} 2>/dev/null`.quiet();
+    const line = result.stdout.toString().trim();
+    if (!line) break;
+    const tokens = line.split(/\s+/);
+    currentPid = parseInt(tokens.pop() || "1", 10);
+    const columnValue = tokens.join(" ") || "";
+    if (!columnValue) break;
+    const matched = onValue(columnValue);
+    if (matched !== null) return matched;
+  }
+  return null;
 }
 
+// ─── AppleScript Runner ──────────────────────────────────────────────────────
+
+async function runAppleScript($, script: string) {
+  try {
+    const result = await $`osascript -e ${script} 2>/dev/null`.quiet();
+    const raw = result.stdout.toString().trim();
+    await log("AppleScript output:", JSON.stringify(raw));
+    return raw;
+  } catch (err) {
+    await log(
+      "AppleScript: ERROR running:",
+      script,
+      "with result:",
+      String(err),
+    );
+    return "";
+  }
+}
+
+// ─── kitty Focus Handling ────────────────────────────────────────────────────
+
+// in kitty, self has frontmost focus only if every node it is inside also has focus
+function hasSelfInFocusChain(node: Record<string, unknown>): boolean {
+  const isFocused = (node.is_focused as boolean | undefined) ?? true;
+  if (!isFocused) return false;
+  if (node.is_self) return true;
+
+  // Recurse into children: tabs or windows arrays
+  const tabs = node.tabs as Array<Record<string, unknown>> | undefined;
+  if (tabs) {
+    for (const child of tabs) {
+      if (hasSelfInFocusChain(child)) return true;
+    }
+  }
+
+  const windows = node.windows as Array<Record<string, unknown>> | undefined;
+  if (windows) {
+    for (const child of windows) {
+      if (hasSelfInFocusChain(child)) return true;
+    }
+  }
+
+  return false;
+}
+
+async function isKittyFocused($): Promise<boolean> {
+  try {
+    const result = await $`kitty @ ls 2>/dev/null`.quiet();
+    const raw = result.stdout.toString().trim();
+    if (!raw) {
+      await log(
+        "isKittyFocused: no kitty @ ls output (remote control may not be enabled)",
+      );
+      return false;
+    }
+
+    let data = JSON.parse(raw);
+    for (const w of data as Array<Record<string, unknown>>) {
+      if (hasSelfInFocusChain(w)) {
+        await log("isKittyFocused: our process is in the focused chain");
+        return true;
+      }
+    }
+
+    await log("isKittyFocused: our process is not in the focused chain");
+    return false;
+  } catch (err) {
+    await log("isKittyFocused: ERROR", String(err));
+    return false;
+  }
+}
+
+// ─── Focus Checkers ──────────────────────────────────────────────────────────
+
+async function checkFocusedTTY(
+  $,
+  getFocusedTTY: () => Promise<string | null>,
+): Promise<boolean> {
+  let ourTTY = normalizeTTY(
+    await walkProcessTree($, process.pid, "tty", (tty) => {
+      if (tty && tty !== "??") {
+        return tty;
+      }
+      return null;
+    }),
+  );
+  if (!ourTTY) {
+    await log(`checkFocusedTTY: no session TTY found`);
+    return false;
+  }
+  const focused = normalizeTTY(await getFocusedTTY());
+  if (!focused) {
+    await log(`checkFocusedTTY: our TTY`, ourTTY, `no focused window found`);
+    return false;
+  }
+  if (focused === ourTTY) {
+    await log(
+      `checkFocusedTTY: our TTY`,
+      ourTTY,
+      `focused TTY`,
+      focused,
+      `TTY match — our session is in a focused tab`,
+    );
+    return true;
+  }
+  await log(
+    `checkFocusedTTY: our TTY`,
+    ourTTY,
+    `focused TTY`,
+    focused,
+    `TTY mismatch — another session has focus`,
+  );
+  return false;
+}
+
+async function checkWezTermFocused($): Promise<boolean> {
+  const ourPane = process.env.WEZTERM_PANE;
+  await log("checkWezTermFocused: WEZTERM_PANE=", JSON.stringify(ourPane));
+  if (!ourPane) {
+    await log("checkWezTermFocused: no WEZTERM_PANE set");
+    return false;
+  }
+  let activeText = "";
+  try {
+    const result =
+      await $`zsh -c 'env -u WEZTERM_PANE wezterm cli get-text' 2>/dev/null`.quiet();
+    activeText = result.stdout.toString().trim();
+  } catch (err) {
+    await log("checkWezTermFocused: get-text failed:", String(err));
+    return false;
+  }
+  let ourText = "";
+  try {
+    const result =
+      await $`wezterm cli get-text --pane-id ${ourPane} 2>/dev/null`.quiet();
+    ourText = result.stdout.toString().trim();
+  } catch (err) {
+    await log("checkWezTermFocused: get-text --pane-id failed:", String(err));
+    return false;
+  }
+  await log(
+    "checkWezTermFocused: activeText=",
+    JSON.stringify(activeText.substring(0, 100)),
+    "ourText=",
+    JSON.stringify(ourText.substring(0, 100)),
+  );
+  if (activeText !== "" && activeText === ourText) {
+    await log("checkWezTermFocused: text match — our pane is focused");
+    return true;
+  }
+  await log("checkWezTermFocused: no text match — another pane has focus");
+  return false;
+}
+
+async function checkAlacrittyFocused($): Promise<boolean> {
+  const focusedTitle = await runAppleScript(
+    $,
+    `
+tell application "System Events"
+  return title of front window of process "Alacritty"
+end tell`,
+  );
+  if (
+    focusedTitle &&
+    (focusedTitle.startsWith(OC_WINDOW_PREFIX) ||
+      focusedTitle === OC_WINDOW_TITLE)
+  ) {
+    await log("checkAlacrittyFocused: focused title matches opencode window");
+    return true;
+  }
+  await log(
+    "checkAlacrittyFocused: focused title=",
+    JSON.stringify(focusedTitle),
+    "— not an opencode window",
+  );
+  return false;
+}
+
+// ─── Focus Orchestration ─────────────────────────────────────────────────────
+
 async function isTerminalFocused($) {
-  const terminal = await getParentTerminal($);
-  if (!terminal) { await log("isTerminalFocused: no terminal found"); return false; }
+  const terminalName = await walkProcessTree($, process.pid, "comm", (comm) => {
+    const commName = comm.split("/").pop() || comm;
+    if (TERMINALS.some((t) => t.toLowerCase() === commName.toLowerCase())) {
+      return commName;
+    }
+    return null;
+  });
+  if (!terminalName) {
+    await log("isTerminalFocused: no terminal found");
+    return false;
+  }
 
   try {
-    // Quick check: app must be frontmost
-    const frontmost = await $`osascript -e 'tell application "System Events" to get frontmost of process "${terminal.eventsName}"' 2>/dev/null`.quiet();
-    const frontmostVal = frontmost.stdout.toString().trim();
-    await log("isTerminalFocused: eventsName=", terminal.eventsName, "pid=", terminal.pid, "frontmost=", frontmostVal);
-    if (frontmostVal !== "true") { await log("isTerminalFocused: app not frontmost"); return false; }
-
-    // iTerm2: use TTY-based comparison since getFocusedWindowPid returns main app unix_id (never matches shell pid)
-    if (terminal.eventsName === "iTerm2") {
-      let ourTTY = "";
-      try {
-        ourTTY = normalizeTTY(await getSessionTTY($));
-      } catch (err) {
-        await log("isTerminalFocused iTerm2: failed to get our TTY:", String(err));
-      }
-      let focusedTabTTYS: string[] = [];
-      try {
-        focusedTabTTYS = await getFocusedIterm2TabTTYS($);
-      } catch (err) {
-        await log("isTerminalFocused iTerm2: getFocusedIterm2TabTTYS failed — another session likely has focus");
-        return false;
-      }
-      await log("isTerminalFocused iTerm2: ourTTY=", JSON.stringify(ourTTY), "focusedTabTTYS=", JSON.stringify(focusedTabTTYS));
-      if (ourTTY !== "" && focusedTabTTYS.length > 0) {
-        if (focusedTabTTYS.includes(ourTTY)) {
-          await log("isTerminalFocused iTerm2: TTY match — our session is in a focused tab");
-          return true;
-        }
-      }
-      await log("isTerminalFocused iTerm2: no TTY match — another session has focus, continuing bell");
+    await log("isTerminalFocused: name=", terminalName);
+    const frontmost = await runAppleScript(
+      $,
+      `tell application "System Events" to get frontmost of process "${terminalName}"`,
+    );
+    if (frontmost !== "true") {
+      await log("isTerminalFocused: app not frontmost");
       return false;
     }
 
-    if (terminal.eventsName === "kitty") {
-      let ourTTY = "";
-      try {
-        ourTTY = normalizeTTY(await getSessionTTY($));
-      } catch (err) {
-        await log("isTerminalFocused kitty: failed to get our TTY:", String(err));
-      }
-
-      if (ourTTY === "") {
-        await log("isTerminalFocused kitty: no session TTY found");
-        return false;
-      }
-
-      let focusedTabTTYS: string[] = [];
-      try {
-        focusedTabTTYS = await getFocusedKittyTabTTYS($);
-      } catch (err) {
-        await log("isTerminalFocused kitty: getFocusedKittyTabTTYS failed — another session likely has focus");
-        return false;
-      }
-
-      if (focusedTabTTYS.length > 0) {
-        if (focusedTabTTYS.includes(ourTTY)) {
-          await log("isTerminalFocused kitty: IPC TTY match — our session is in a focused tab");
-          return true;
-        }
-        await log("isTerminalFocused kitty: IPC no TTY match — another session has focus, continuing bell");
-        return false;
-      }
-
-      await log("isTerminalFocused kitty: no focused window found by IPC — another session has focus, continuing bell");
-      return false;
-    }
-
-    // Ghostty: TTY-based comparison via AppleScript (requires prerelease build with tty on terminal objects)
-    if (terminal.eventsName === "Ghostty") {
-      let ourTTY = "";
-      try {
-        ourTTY = normalizeTTY(await getSessionTTY($));
-      } catch (err) {
-        await log("isTerminalFocused Ghostty: failed to get our TTY:", String(err));
-      }
-
-      if (ourTTY === "") {
-        await log("isTerminalFocused Ghostty: no session TTY found");
-        return false;
-      }
-
-      let focusedTabTTY = "";
-      try {
-        focusedTabTTY = await getFocusedGhosttyTabTTY($);
-      } catch (err) {
-        await log("isTerminalFocused Ghostty: getFocusedGhosttyTabTTY failed — another session likely has focus");
-        return false;
-      }
-
-      await log("isTerminalFocused Ghostty: ourTTY=", JSON.stringify(ourTTY), "focusedTabTTY=", JSON.stringify(focusedTabTTY));
-      if (ourTTY !== "" && focusedTabTTY !== null) {
-        if (ourTTY === normalizeTTY(focusedTabTTY)) {
-          await log("isTerminalFocused Ghostty: TTY match — our session is in a focused tab");
-          return true;
-        }
-        await log("isTerminalFocused Ghostty: TTY mismatch — another session has focus, continuing bell");
-        return false;
-      }
-
-      await log("isTerminalFocused Ghostty: no focused terminal found by AppleScript — another session has focus, continuing bell");
-      return false;
-    }
-
-    // WezTerm: compare focused pane text with our pane text via CLI
-    // Spawn via zsh to ensure $WEZTERM_PANE is not inherited, so wezterm falls back to showing the globally-focused pane
-    if (terminal.eventsName === "WezTerm") {
-      const ourPane = process.env.WEZTERM_PANE;
-      await log("isTerminalFocused WezTerm: WEZTERM_PANE=", JSON.stringify(ourPane));
-      if (!ourPane) {
-        await log("isTerminalFocused WezTerm: no WEZTERM_PANE set");
-        return false;
-      }
-
-      let activeText = "";
-      try {
-        const result = await $`zsh -c 'env -u WEZTERM_PANE wezterm cli get-text'`.quiet();
-        activeText = result.stdout.toString().trim();
-      } catch (err) {
-        await log("isTerminalFocused WezTerm: get-text failed:", String(err));
-        return false;
-      }
-
-      let ourText = "";
-      try {
-        const result = await $`wezterm cli get-text --pane-id ${ourPane} 2>/dev/null`.quiet();
-        ourText = result.stdout.toString().trim();
-      } catch (err) {
-        await log("isTerminalFocused WezTerm: get-text for pane failed:", String(err));
-        return false;
-      }
-
-      await log("isTerminalFocused WezTerm: activeText=", JSON.stringify(activeText.substring(0, 100)), "ourText=", JSON.stringify(ourText.substring(0, 100)));
-      if (activeText !== "" && activeText === ourText) {
-        await log("isTerminalFocused WezTerm: text match — our pane is focused");
+    switch (terminalName.toLowerCase()) {
+      case "terminal":
+        return await checkFocusedTTY(
+          $,
+          async () =>
+            await runAppleScript(
+              $,
+              `
+tell application "Terminal"
+  return (tty of front window) as text
+end tell`,
+            ),
+        );
+      case "iterm2":
+        return await checkFocusedTTY(
+          $,
+          async () =>
+            await runAppleScript(
+              $,
+              `
+tell application "iTerm2"
+  return tty of current session of current tab of current window
+end tell`,
+            ),
+        );
+      case "kitty":
+        return await isKittyFocused($);
+      case "ghostty":
+        return await checkFocusedTTY(
+          $,
+          async () =>
+            await runAppleScript(
+              $,
+              `
+tell application "Ghostty"
+  return (tty of focused terminal of selected tab of front window) as text
+end tell`,
+            ),
+        );
+      case "wezterm-gui":
+        return await checkWezTermFocused($);
+      case "alacritty":
+        return await checkAlacrittyFocused($);
+      default: // this line shouldn't fire due to earlier guards
         return true;
-      }
-      await log("isTerminalFocused WezTerm: no text match — another pane has focus, continuing bell");
-      return false;
     }
-
-    // Alacritty: focus detection via window title — we can only read the focused window's title via AppleScript
-    if (terminal.eventsName === "Alacritty") {
-      const focusedTitle = await getFocusedAlacrittyWindowTitle($);
-      if (focusedTitle && (focusedTitle.startsWith("OC | ") || focusedTitle === "OpenCode")) {
-        await log("isTerminalFocused Alacritty: focused title starts with \"OC | \" or equals \"OpenCode\" — opencode window has focus");
-        return true;
-      }
-      await log("isTerminalFocused Alacritty: focused title=", JSON.stringify(focusedTitle), "— not an opencode window, continuing bell");
-      return false;
-    }
-
-    // For scriptable terminals that support per-window PID detection, compare directly
-    const focusedPid = await getFocusedWindowPid(terminal.eventsName, $);
-    if (focusedPid !== null) {
-      await log("isTerminalFocused: focusedPid=", focusedPid, "our pid=", terminal.pid);
-      if (focusedPid === terminal.pid || await isDescendantOf(focusedPid, terminal.pid, $)) {
-        await log("isTerminalFocused: PID match via focused window");
-        return true;
-      }
-    }
-
-    // Terminal.app: compare our session TTY with the focused tab's TTY via AppleScript
-    if (terminal.eventsName === "Terminal") {
-      const ourTTY = await getSessionTTY($);
-      const focusedTabTTY = await getFocusedTerminalAppTabTTY($);
-      await log("isTerminalFocused Terminal.app: ourTTY=", JSON.stringify(ourTTY), "focusedTabTTY=", JSON.stringify(focusedTabTTY));
-      if (normalizeTTY(ourTTY) === normalizeTTY(focusedTabTTY)) {
-        await log("isTerminalFocused: TTY match — our tab is focused");
-        return true;
-      }
-      await log("isTerminalFocused: TTY mismatch — another tab has focus, continuing bell");
-      return false;
-    }
-
-    // For unscriptable terminals, verify we are running inside the terminal by walking ancestor chain
-    await log("isTerminalFocused: falling back to check if in focused terminal");
-    return await isInFrontmostTerminal(process.pid, terminal.eventsName, $);
   } catch (err) {
     await log("isTerminalFocused: ERROR", String(err));
     return false;
   }
 }
 
-async function isDescendantOf(childPid: number, ancestorPid: number, $) {
+// ─── Alert ───────────────────────────────────────────────────────────────────
+
+async function playAlert($, label: string) {
+  lastBellTimestamp = Date.now();
+  await log("playAlert", label);
+  await Bun.write(Bun.stdout, BELL_CHAR);
   try {
-    await log("isDescendantOf: checking if", childPid, "is descendant of", ancestorPid);
-    let currentPid = childPid;
-    let depth = 0;
-    while (currentPid && !isNaN(currentPid) && currentPid !== 1 && currentPid !== ancestorPid) {
-      const ppid = parseInt(await queryPid($, currentPid, "ppid"), 10);
-      await log("isDescendantOf depth", depth, "pid", currentPid, "ppid", ppid);
-      if (isNaN(ppid)) { await log("isDescendantOf: isNaN ppid"); return false; }
-      if (ppid === ancestorPid) { await log("isDescendantOf: MATCH at depth", depth); return true; }
-      currentPid = ppid;
-      depth++;
-    }
-    await log("isDescendantOf: no match, stopped at pid", currentPid);
-    return false;
+    await $`afplay ${BELL_SOUND} 2>/dev/null`.quiet();
   } catch (err) {
-    await log("isDescendantOf: ERROR", String(err));
-    return false;
+    await log("afplay FAILED", label, String(err));
   }
 }
 
-async function isInFrontmostTerminal(pid: number, frontmostName: string, $) {
-  try {
-    await log("isInFrontmostTerminal: checking if pid", pid, "runs inside frontmost terminal:", frontmostName);
+// ─── Plugin Entry Point ──────────────────────────────────────────────────────
 
-    // Walk up our ancestor chain to find which terminal app we're running in
-    let currentPid = pid;
-    let depth = 0;
-    const MAX_DEPTH = 15;
+export const TerminalBell: Plugin = async ({
+  project,
+  client,
+  $,
+  directory,
+  worktree,
+}) => {
+  // Erase log on opencode start / plugin loading
+  if (LOG_ENABLED) await fs.unlink(LOG_PATH).catch(() => {});
+  await log("Cleared log for new opencode instance");
 
-    while (currentPid && !isNaN(currentPid) && currentPid !== 1 && depth < MAX_DEPTH) {
-      const comm = await queryPid($, currentPid, "comm");
-      if (!comm) break;
-
-      const commName = comm.split("/").pop() || comm;
-
-      for (const term of TERMINALS) {
-        const nameMatch = commName.toLowerCase() === term.name.toLowerCase();
-        const aliasMatch = term.aliases?.some(a => a.toLowerCase() === commName.toLowerCase());
-        if (nameMatch || aliasMatch) {
-          // Found which terminal we're running in - check if it's frontmost
-          await log("isInFrontmostTerminal: found ancestor terminal", term.name, "at depth", depth);
-          const frontmost = await $`osascript -e 'tell application "System Events" to get frontmost of process "${term.eventsName}"' 2>/dev/null`.quiet();
-          const val = frontmost.stdout.toString().trim();
-          await log("isInFrontmostTerminal:", term.name, "frontmost=", val);
-          return val === "true";
-        }
-      }
-
-      currentPid = parseInt(await queryPid($, currentPid, "ppid"), 10);
-      depth++;
-    }
-
-    // No terminal ancestor found - we're not running inside a known terminal app
-    await log("isInFrontmostTerminal: no terminal ancestor found");
-    return false;
-  } catch (err) {
-    await log("isInFrontmostTerminal: ERROR", String(err));
-    return false;
-  }
-}
-
-async function isOurChildFrontmost(ourPid: number, $) {
-  try {
-    await log("isOurChildFrontmost: checking descendants of pid=", ourPid);
-
-    // Walk entire descendant tree recursively using a BFS approach
-    let currentLevel = [ourPid];
-    let depth = 0;
-    const MAX_DEPTH = 10;
-
-    while (currentLevel.length > 0 && depth < MAX_DEPTH) {
-      const nextLevel: number[] = [];
-      
-      for (const pid of currentLevel) {
-        // Check cmdline for opencode at this level
-        try {
-          const cmd = await queryPid($, pid, "args");
-          await log("isOurChildFrontmost depth", depth, "pid", pid, "cmd:", cmd.substring(0, 120));
-          if (cmd.includes('opencode')) {
-            await log("isOurChildFrontmost: FOUND opencode at pid", pid, "depth", depth);
-            return true;
-          }
-        } catch { /* process may have exited */ }
-
-        // Get children for next level
-        try {
-          const childResult = await $`ps -o pid= --ppid ${pid} 2>/dev/null`.quiet();
-          const childPids = childResult.stdout.toString().trim().split(/\s+/).map(s => parseInt(s, 10)).filter(n => !isNaN(n));
-          nextLevel.push(...childPids);
-        } catch { /* may fail for some pids */ }
-      }
-
-      currentLevel = nextLevel;
-      depth++;
-    }
-
-    await log("isOurChildFrontmost: no opencode found in descendants (checked to depth", MAX_DEPTH, ")");
-    return false;
-  } catch (err) {
-    await log("isOurChildFrontmost: ERROR", String(err));
-    return false;
-  }
-}
-
-async function playAlert($, label = "") {
-  log("playAlert", label || "first");
-  await Bun.write(Bun.stdout, "\x07");
-  try {
-    await $`afplay /System/Library/Sounds/Ping.aiff 2>/dev/null`.quiet();
-    log("afplay OK", label);
-  } catch (err) {
-    console.warn("Failed to play audible bell:", err);
-    log("afplay FAILED", label, String(err));
-  }
-}
-
-export const TerminalBell: Plugin = async ({ project, client, $, directory, worktree }) => {
-  return { // look up types.gen.ts at https://github.com/anomalyco/opencode/ for event types
+  return {
+    // opencode event types are in a types.gen.ts file
     event: async ({ event }) => {
-      // Clear log on new session start — session.created is published as a bus event by the sync system. There is no event to capture for opencode app startup.
-      if (event.type === "session.created") {
-        await fs.unlink(LOG_PATH).catch(() => {});
-        await log("Cleared log for new session", event.properties.sessionID);
-        return;
-      }
-
       // Skip subagent sessions — they run independently without needing user attention
       if (event.type === "session.idle" && event.properties.sessionID) {
         try {
-          const session = await client.session.get({ path: { id: event.properties.sessionID } });
-            log("SESSION idle", JSON.stringify(session));
-          if (session.parentID) { log("SKIP subagent session", event.properties.sessionID); return; }
-        } catch { /* ignore lookup errors */ }
+          const session = await client.session.get({
+            path: { id: event.properties.sessionID },
+          });
+          if (session.data.parentID) {
+            await log("SKIP subagent session", event.properties.sessionID);
+            return;
+          }
+        } catch {
+          /* ignore lookup errors */
+        }
       }
 
-      const isTriggerEvent = event.type === "session.idle" || event.type === "permission.asked" || event.type === "session.error" || event.type === "question.asked"; // question.asked event not documented, but exists and found here - https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/question/index.ts
-      if (!isTriggerEvent) return;
-      
-      log("EVENT", event.type, JSON.stringify(event.properties));
+      if (!TRIGGER_EVENT_TYPES.includes(event.type)) return;
 
-      const elapsed = Date.now() - lastBellTimestamp;
-      if (elapsed < COOLDOWN_MS) { log("COOLDOWN skip", `${elapsed}ms / ${COOLDOWN_MS}ms`); return; }
+      await log("EVENT", event.type, JSON.stringify(event.properties));
+
+      let elapsed = Date.now() - lastBellTimestamp;
+      if (elapsed < COOLDOWN_MS) {
+        await log("COOLDOWN skip", `${elapsed}ms / ${COOLDOWN_MS}ms`);
+        return;
+      }
 
       await playAlert($, "first");
-
-      lastBellTimestamp = Date.now();
-      for (let i = 1; i < PLAY_COUNT; i++) {         // remaining repeats
-        log("WAITING before repeat", i + 1, `(${elapsed}ms since cooldown)`);
-        await new Promise(resolve => setTimeout(resolve, WAIT_INTERVAL));
+      for (let i = 1; i < PLAY_COUNT; i++) {
+        // remaining repeats
+        elapsed = Date.now() - lastBellTimestamp;
+        const sleepMs = Math.max(0, WAIT_INTERVAL - elapsed);
+        if (sleepMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, sleepMs));
+        }
         const focused = await isTerminalFocused($);
-        if (focused) { log("TERMINAL FOCUSED — stopping repeats"); break; }
-        log("TERMINAL NOT FOCUSED — playing repeat", i + 1);
+        if (focused) {
+          await log("TERMINAL FOCUSED — stopping repeats");
+          break;
+        }
+        await log("TERMINAL NOT FOCUSED — playing repeat", i + 1);
         await playAlert($, `repeat ${i + 1}`);
       }
     },
