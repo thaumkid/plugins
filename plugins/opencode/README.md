@@ -2,7 +2,7 @@
 
 An OpenCode plugin that rings your terminal bell when a session completes, goes idle, needs permission, encounters an error, or asks a question.
 
-Designed for macOS with support for multiple terminal emulators and intelligent focus detection to avoid ringing when your terminal isn't in focus.
+Designed for macOS with support for multiple terminal emulators and intelligent focus detection to avoid additional ringing when your terminal is already in focus.
 
 ## Installation
 
@@ -32,8 +32,9 @@ When a matching event fires, the plugin:
 1. Rings the bell once via `afplay` and a raw bell character (`\x07`)
 2. Checks if your terminal window is in focus
 3. If the terminal is not focused, rings again after a configurable interval
-4. Repeats up to `PLAY_COUNT` times
-5. Stops if the terminal comes into focus or the cooldown period passes
+4. Guarantees at least `MIN_PLAY_COUNT` beeps, then stops if the terminal comes into focus
+5. Repeats up to `MAX_PLAY_COUNT` total beeps
+6. Skips if the cooldown period hasn't passed since the last trigger
 
 ## Configuration
 
@@ -41,7 +42,8 @@ Edit the constants at the top of `terminal-bell.ts`:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `PLAY_COUNT` | `3` | Total number of bell repetitions |
+| `MIN_PLAY_COUNT` | `2` | Guaranteed minimum beeps before focus check applies |
+| `MAX_PLAY_COUNT` | `5` | Maximum total beeps per trigger |
 | `WAIT_INTERVAL` | `3000` | Milliseconds between bell repeats |
 | `COOLDOWN_MS` | `30000` | Minimum ms between separate bell triggers |
 | `BELL_CHAR` | `"\x07"` | Raw bell character written to stdout |
