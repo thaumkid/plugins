@@ -15,4 +15,4 @@ plugins/
   opencode/     → OpenCode plugins
 ```
 
-New plugins are added as subdirectories. Each plugin is self-contained with its own README.
+New plugins are added in appropriate subdirectories. Each folder has its own README describing the plugins in more detail.
