@@ -1,13 +1,16 @@
 import fs from "fs/promises";
+import type { BunShell } from "@opencode-ai/plugin/shell";
 
 // note to users: make sure Bun is installed
 // this script requires your terminal program to have "System Events" permissions, which will be asked for on first execution
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const PLAY_COUNT = 3; // total repetitions
+const MIN_PLAY_COUNT = 2; // guaranteed beeps
+const MAX_PLAY_COUNT = 5; // maximum total beeps
 const WAIT_INTERVAL = 3000; // ms between repeats
 const COOLDOWN_MS = 30_000; // min ms between separate bell trigger events
+let lastBellTimestamp = Date.now() - COOLDOWN_MS; // epoch ms of last trigger
 const BELL_CHAR = "\x07";
 const BELL_SOUND = "/System/Library/Sounds/Ping.aiff";
 const TRIGGER_EVENT_TYPES = [
@@ -16,10 +19,6 @@ const TRIGGER_EVENT_TYPES = [
   "session.error",
   "question.asked",
 ];
-
-const OC_WINDOW_PREFIX = "OC | ";
-const OC_WINDOW_TITLE = "OpenCode";
-let lastBellTimestamp = Date.now() - COOLDOWN_MS; // epoch ms of last trigger
 
 // Terminals tested and supported (process names match .app/Contents/MacOS/<name>)
 // iTerm2: process name for iTerm. has a python API that could be easier than our approach, but ours works without Magic - Python API enabled
@@ -41,7 +40,7 @@ const TERMINALS = [
 const LOG_ENABLED = true;
 const LOG_PATH = `${import.meta.dir}/terminal-bell.log`;
 
-async function log(...args: unknown[]) {
+async function log(...args: unknown[]): Promise<void> {
   if (!LOG_ENABLED) return;
   const ts = new Date().toISOString();
   await fs.appendFile(LOG_PATH, `[${ts}] ${args.join(" ")}\n`);
@@ -55,7 +54,7 @@ function normalizeTTY(tty: string | null): string {
 }
 
 async function walkProcessTree(
-  $,
+  $: BunShell,
   startPid: number,
   column: string,
   onValue: (value: string) => string | null,
@@ -78,7 +77,19 @@ async function walkProcessTree(
 
 // ─── AppleScript Runner ──────────────────────────────────────────────────────
 
-async function runAppleScript($, script: string) {
+const TTY_FETCH_SCRIPTS: Record<string, string> = {
+  terminal: `tell application "Terminal"
+  return (tty of front window) as text
+end tell`,
+  iterm2: `tell application "iTerm2"
+  return tty of current session of current tab of current window
+end tell`,
+  ghostty: `tell application "Ghostty"
+  return (tty of focused terminal of selected tab of front window) as text
+end tell`,
+};
+
+async function runAppleScript($: BunShell, script: string): Promise<string> {
   try {
     const result = await $`osascript -e ${script} 2>/dev/null`.quiet();
     const raw = result.stdout.toString().trim();
@@ -86,10 +97,7 @@ async function runAppleScript($, script: string) {
     return raw;
   } catch (err) {
     await log(
-      "AppleScript: ERROR running:",
-      script,
-      "with result:",
-      String(err),
+      `AppleScript: ERROR running: ${script} with result ${String(err)}`,
     );
     return "";
   }
@@ -121,7 +129,7 @@ function hasSelfInFocusChain(node: Record<string, unknown>): boolean {
   return false;
 }
 
-async function isKittyFocused($): Promise<boolean> {
+async function isKittyFocused($: BunShell): Promise<boolean> {
   try {
     const result = await $`kitty @ ls 2>/dev/null`.quiet();
     const raw = result.stdout.toString().trim();
@@ -151,7 +159,7 @@ async function isKittyFocused($): Promise<boolean> {
 // ─── Focus Checkers ──────────────────────────────────────────────────────────
 
 async function checkFocusedTTY(
-  $,
+  $: BunShell,
   getFocusedTTY: () => Promise<string | null>,
 ): Promise<boolean> {
   let ourTTY = normalizeTTY(
@@ -168,30 +176,18 @@ async function checkFocusedTTY(
   }
   const focused = normalizeTTY(await getFocusedTTY());
   if (!focused) {
-    await log(`checkFocusedTTY: our TTY`, ourTTY, `no focused window found`);
+    await log(`checkFocusedTTY: no focused window found`);
     return false;
   }
   if (focused === ourTTY) {
-    await log(
-      `checkFocusedTTY: our TTY`,
-      ourTTY,
-      `focused TTY`,
-      focused,
-      `TTY match — our session is in a focused tab`,
-    );
+    await log(`checkFocusedTTY: TTY match — our session is focused`);
     return true;
   }
-  await log(
-    `checkFocusedTTY: our TTY`,
-    ourTTY,
-    `focused TTY`,
-    focused,
-    `TTY mismatch — another session has focus`,
-  );
+  await log(`checkFocusedTTY: TTY mismatch — our=${ourTTY} focused=${focused}`);
   return false;
 }
 
-async function checkWezTermFocused($): Promise<boolean> {
+async function checkWezTermFocused($: BunShell): Promise<boolean> {
   const ourPane = process.env.WEZTERM_PANE;
   await log("checkWezTermFocused: WEZTERM_PANE=", JSON.stringify(ourPane));
   if (!ourPane) {
@@ -217,9 +213,10 @@ async function checkWezTermFocused($): Promise<boolean> {
     return false;
   }
   await log(
-    "checkWezTermFocused: activeText=",
+    "checkWezTermFocused:",
+    "active=",
     JSON.stringify(activeText.substring(0, 100)),
-    "ourText=",
+    "our=",
     JSON.stringify(ourText.substring(0, 100)),
   );
   if (activeText !== "" && activeText === ourText) {
@@ -230,7 +227,7 @@ async function checkWezTermFocused($): Promise<boolean> {
   return false;
 }
 
-async function checkAlacrittyFocused($): Promise<boolean> {
+async function checkAlacrittyFocused($: BunShell): Promise<boolean> {
   const focusedTitle = await runAppleScript(
     $,
     `
@@ -240,8 +237,7 @@ end tell`,
   );
   if (
     focusedTitle &&
-    (focusedTitle.startsWith(OC_WINDOW_PREFIX) ||
-      focusedTitle === OC_WINDOW_TITLE)
+    (focusedTitle.startsWith("OC | ") || focusedTitle === "OpenCode")
   ) {
     await log("checkAlacrittyFocused: focused title matches opencode window");
     return true;
@@ -256,7 +252,7 @@ end tell`,
 
 // ─── Focus Orchestration ─────────────────────────────────────────────────────
 
-async function isTerminalFocused($) {
+async function isTerminalFocused($: BunShell): Promise<boolean> {
   const terminalName = await walkProcessTree($, process.pid, "comm", (comm) => {
     const commName = comm.split("/").pop() || comm;
     if (TERMINALS.some((t) => t.toLowerCase() === commName.toLowerCase())) {
@@ -280,50 +276,21 @@ async function isTerminalFocused($) {
       return false;
     }
 
-    switch (terminalName.toLowerCase()) {
-      case "terminal":
-        return await checkFocusedTTY(
-          $,
-          async () =>
-            await runAppleScript(
-              $,
-              `
-tell application "Terminal"
-  return (tty of front window) as text
-end tell`,
-            ),
-        );
-      case "iterm2":
-        return await checkFocusedTTY(
-          $,
-          async () =>
-            await runAppleScript(
-              $,
-              `
-tell application "iTerm2"
-  return tty of current session of current tab of current window
-end tell`,
-            ),
-        );
+    const lower = terminalName.toLowerCase();
+    switch (lower) {
       case "kitty":
         return await isKittyFocused($);
-      case "ghostty":
-        return await checkFocusedTTY(
-          $,
-          async () =>
-            await runAppleScript(
-              $,
-              `
-tell application "Ghostty"
-  return (tty of focused terminal of selected tab of front window) as text
-end tell`,
-            ),
-        );
       case "wezterm-gui":
         return await checkWezTermFocused($);
       case "alacritty":
         return await checkAlacrittyFocused($);
-      default: // this line shouldn't fire due to earlier guards
+      default:
+        if (TTY_FETCH_SCRIPTS[lower]) {
+          return await checkFocusedTTY(
+            $,
+            async () => await runAppleScript($, TTY_FETCH_SCRIPTS[lower]),
+          );
+        }
         return true;
     }
   } catch (err) {
@@ -334,9 +301,14 @@ end tell`,
 
 // ─── Alert ───────────────────────────────────────────────────────────────────
 
-async function playAlert($, label: string) {
-  lastBellTimestamp = Date.now();
+async function playAlert($: BunShell, label: string): Promise<void> {
+  const elapsed = Date.now() - lastBellTimestamp;
+  const sleepMs = Math.max(0, WAIT_INTERVAL - elapsed);
+  if (sleepMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, sleepMs));
+  }
   await log("playAlert", label);
+  lastBellTimestamp = Date.now();
   await Bun.write(Bun.stdout, BELL_CHAR);
   try {
     await $`afplay ${BELL_SOUND} 2>/dev/null`.quiet();
@@ -355,7 +327,7 @@ export const TerminalBell: Plugin = async ({
   worktree,
 }) => {
   // Erase log on opencode start / plugin loading
-  if (LOG_ENABLED) await fs.unlink(LOG_PATH).catch(() => {});
+  if (LOG_ENABLED) await fs.rm(LOG_PATH, { force: true }).catch(() => {});
   await log("Cleared log for new opencode instance");
 
   return {
@@ -386,21 +358,13 @@ export const TerminalBell: Plugin = async ({
         return;
       }
 
-      await playAlert($, "first");
-      for (let i = 1; i < PLAY_COUNT; i++) {
-        // remaining repeats
-        elapsed = Date.now() - lastBellTimestamp;
-        const sleepMs = Math.max(0, WAIT_INTERVAL - elapsed);
-        if (sleepMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, sleepMs));
+      let focused = false;
+      for (let i = 0; i < MAX_PLAY_COUNT; i++) {
+        if (!focused) {
+          focused = await isTerminalFocused($);
         }
-        const focused = await isTerminalFocused($);
-        if (focused) {
-          await log("TERMINAL FOCUSED — stopping repeats");
-          break;
-        }
-        await log("TERMINAL NOT FOCUSED — playing repeat", i + 1);
-        await playAlert($, `repeat ${i + 1}`);
+        if (i >= MIN_PLAY_COUNT && focused) break;
+        await playAlert($, `beep ${i + 1}`);
       }
     },
   };
