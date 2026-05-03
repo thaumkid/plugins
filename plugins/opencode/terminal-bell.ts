@@ -303,6 +303,10 @@ async function isTerminalFocused($: BunShell): Promise<boolean> {
 
 async function playAlert($: BunShell, label: string): Promise<void> {
   const elapsed = Date.now() - lastBellTimestamp;
+  // sometimes signals like error and idle happen in quick sequence
+  // so we want to update this right away to hopefully snag one
+  // of them in the COOLDOWN_MS guard
+  lastBellTimestamp = Date.now();
   const sleepMs = Math.max(0, WAIT_INTERVAL - elapsed);
   if (sleepMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, sleepMs));
