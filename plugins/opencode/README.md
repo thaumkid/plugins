@@ -1,5 +1,7 @@
 # Terminal Bell
 
+Note that this notifier exists --> https://github.com/mohak34/opencode-notifier. It doesn't detect window focus with the same degree of accuracy as this tool.
+
 An OpenCode plugin that rings your terminal bell when a session completes, goes idle, needs permission, encounters an error, or asks a question.
 
 Designed for macOS with support for multiple terminal emulators and intelligent focus detection to avoid additional ringing when your terminal is already in focus.
